@@ -1,13 +1,15 @@
+#!/usr/bin/env python3
 import os
 import json
 import openai
 from gtts import gTTS
 from moviepy.editor import (
     ColorClip, ImageClip, AudioFileClip,
-    CompositeVideoClip, TextClip, concatenate_videoclips
+    CompositeVideoClip, VideoFileClip, concatenate_videoclips
 )
 from dotenv import load_dotenv
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 import textwrap
 import uuid
 import time
@@ -21,7 +23,7 @@ if not OPENAI_API_KEY:
 openai.api_key = OPENAI_API_KEY
 
 OUT_DIR = Path("outputs")
-ASSETS_DIR = Path("assets")  # optional: put any stock short clips here, named clip1.mp4 etc.
+ASSETS_DIR = Path("assets")  # optional
 OUT_DIR.mkdir(exist_ok=True)
 ASSETS_DIR.mkdir(exist_ok=True)
 
@@ -29,23 +31,21 @@ ASSETS_DIR.mkdir(exist_ok=True)
 def generate_tech_tips(num_tips=5):
     prompt = f"Generate {num_tips} short, punchy tech tips suitable for a 15-30 second Instagram Reel. Each tip should be 1-2 short sentences. Number them."
     resp = openai.ChatCompletion.create(
-        model="gpt-4",  # or "gpt-4o" / "gpt-4o-mini" depending on your access
+        model="gpt-4",
         messages=[{"role":"user", "content":prompt}],
         temperature=0.7,
         max_tokens=400
     )
     text = resp["choices"][0]["message"]["content"]
-    # parse by lines containing "1." etc
     lines = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        # if line starts with number or dash, remove numbering
-        if line[0].isdigit() and (line[1] == '.' or line[1] == ')'):
-            line = line.split('.',1)[1].strip() if '.' in line else line
+        # remove leading numbering like "1." or "1)"
+        if len(line) > 1 and line[0].isdigit() and (line[1] in ['.', ')']):
+            line = line.split(line[1],1)[1].strip()
         lines.append(line)
-    # fallback: if single paragraph, split by sentences
     if len(lines) < num_tips:
         import re
         sentences = re.split(r'(?<=[.!?]) +', text)
@@ -57,7 +57,38 @@ def create_voice(text, out_path):
     tts = gTTS(text=text, lang='en', slow=False)
     tts.save(str(out_path))
 
-# ---- 3) Build a vertical clip (1080x1920) ----
+# ---- 3) Create text image with PIL and return ImageClip ----
+def create_text_image_clip(text, w=1080, h=1920, fontsize=72, duration=8, position=("center","center")):
+    wrapped = textwrap.fill(text, width=24)
+    # create a transparent image
+    img = Image.new("RGBA", (w, h), (0,0,0,0))
+    draw = ImageDraw.Draw(img)
+    # try to load a common font; fallback if not found
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", fontsize)
+    except Exception:
+        font = ImageFont.load_default()
+    # calculate text block size
+    lines = wrapped.split("\n")
+    line_h = font.getsize("Ay")[1] + 10
+    total_h = line_h * len(lines)
+    y_text = int(h*0.2)
+    for line in lines:
+        w_text, _ = draw.textsize(line, font=font)
+        x_text = (w - w_text) // 2
+        draw.text((x_text, y_text), line, font=font, fill=(255,255,255,255))
+        y_text += line_h
+    # CTA at bottom
+    cta = "Follow for daily tech tips ➜ @yourhandle"
+    w_cta, h_cta = draw.textsize(cta, font=font)
+    draw.text(((w - w_cta)//2, int(h*0.88)), cta, font=font, fill=(230,230,230,255))
+    # save to temp file
+    tmp = OUT_DIR / f"text_{uuid.uuid4().hex}.png"
+    img.save(tmp)
+    clip = ImageClip(str(tmp)).set_duration(duration)
+    return clip, tmp
+
+# ---- 4) Build a vertical clip (1080x1920) ----
 def build_video(tip_text, output_path, duration=None, bg_color=(18,18,18), use_stock_clip=None):
     # create audio
     audio_file = output_path.with_suffix(".mp3")
@@ -68,37 +99,35 @@ def build_video(tip_text, output_path, duration=None, bg_color=(18,18,18), use_s
 
     W, H = 1080, 1920
 
-    # background: if you have a matching stock clip, use it and resize/crop
+    # background clip
     if use_stock_clip and Path(use_stock_clip).exists():
-        from moviepy.editor import VideoFileClip
-        bg = VideoFileClip(str(use_stock_clip)).resize(height=H).crop(x_center=0.5, width=W)
-        bg = bg.subclip(0, min(clip_duration, bg.duration)).set_duration(clip_duration)
+        try:
+            bg = VideoFileClip(str(use_stock_clip)).resize(height=H)
+            if bg.w > W:
+                bg = bg.crop(width=W, height=H, x_center=bg.w/2, y_center=bg.h/2)
+            bg = bg.subclip(0, min(clip_duration, bg.duration)).set_duration(clip_duration)
+        except Exception:
+            bg = ColorClip(size=(W,H), color=bg_color, duration=clip_duration)
     else:
-        # animate a simple color background (solid with slow zoom)
         bg = ColorClip(size=(W, H), color=bg_color, duration=clip_duration)
-        bg = bg.set_fps(24)
 
-    # create text overlay as multiple lines with wrapping
-    wrapped = textwrap.fill(tip_text, width=25)
-    # TextClip uses ImageMagick; if missing, fallback to ImageClip (PIL)
-    txt_clip = (TextClip(wrapped, fontsize=70, font='Arial-Bold', color='white', method='caption', size=(int(W*0.9), None), align='center')
-                .set_duration(clip_duration)
-                .set_position(("center", H*0.25)))
-    
-    # small subtitle or CTA at bottom
-    cta = TextClip("Follow for daily tech tips ➜ @yourhandle", fontsize=38, font='Arial', color='white', method='label')
-    cta = cta.set_duration(clip_duration).set_position(("center", H*0.88)).margin(top=10, opacity=0)
+    # create text image clip via PIL
+    txt_clip, tmp_img = create_text_image_clip(tip_text, w=W, h=H, fontsize=72, duration=clip_duration)
+    txt_clip = txt_clip.set_position(("center","center"))
 
-    # optionally add a translucent rectangle behind text for readability (ImageClip)
-    # Composite everything
-    final = CompositeVideoClip([bg, txt_clip, cta], size=(W, H)).set_duration(clip_duration)
+    final = CompositeVideoClip([bg, txt_clip], size=(W, H)).set_duration(clip_duration)
     final = final.set_audio(audio)
-    # write
+
+    # write the video
     final.write_videofile(str(output_path), fps=24, codec="libx264", audio_codec="aac", threads=2, preset="medium", verbose=False, logger=None)
 
-    # cleanup audio file (optional)
+    # cleanup temp files
     try:
         audio.close()
+    except:
+        pass
+    try:
+        tmp_img.unlink()
     except:
         pass
 
